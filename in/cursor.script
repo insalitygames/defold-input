@@ -5,11 +5,13 @@ local cursor = require "in.cursor"
 go.property("action_id", hash("touch"))
 go.property("drag", true)
 go.property("drag_threshold", 20)
+go.property("collisionobject_filter", hash(""))
 go.property("acquire_input_focus", false)
 go.property("notify_own_gameobject", true)
 
 local COLLISION_RESPONSE = hash("collision_response")
 local INPUT = hash("input")
+local EMPTY_FILTER = hash("")
 
 local action_pos = vmath.vector3()
 local function handle_input(self, action_id, action)
@@ -51,6 +53,7 @@ local function is_mobile()
 end
 
 function init(self)
+	cursor.init()
 	if self.acquire_input_focus then
 		msg.post(".", "acquire_input_focus")
 	end
@@ -62,6 +65,8 @@ function init(self)
 	self.pressed = false
 	self.released = false
 
+	self.action = {}
+	
 	self.state = {
 		pressed = false,
 		dragging = false,
@@ -69,26 +74,42 @@ function init(self)
 	}
 end
 
+function final(self)
+	cursor.final()
+end
+
+local function go_exists(id)
+	if not id then return false end
+	local exists,_ = pcall(function()
+		go.get_position(id)
+	end)
+	return exists
+end
+
 -- Cache the message table to limit the amount of short-lived objects created
 local message = {}
 
-local function notify_event(self, game_object_id, game_object_group, action, message_id)
-	-- pcall to check if the game object exists since it might have been deleted
-	-- typically a cursor_out message that is generated when the game object is deleted
-	local exists,_ = pcall(function()
-		go.get_position(game_object_id)
-	end)
-	if self.notify_own_gameobject then
-		message.id = game_object_id
-		message.group = game_object_group
-		message.x = action.x
-		message.y = action.y
-		msg.post(".", message_id, message)
+local function trigger_event(self, game_object_id, game_object_group, action, message_id)
+	message.id = game_object_id
+	message.group = game_object_group
+	message.x = action.x
+	message.y = action.y
+	local ok = cursor.trigger(message_id, message)
+	if ok then
+		if self.notify_own_gameobject then
+			msg.post(".", message_id, message)
+		end
+
+		-- pcall to check if the game object exists since it might have been deleted
+		-- typically a cursor_out message that is generated when the game object is deleted
+		local exists = go_exists(game_object_id)
+		if exists then
+			msg.post(game_object_id, message_id, message)
+		end
 	end
-	if game_object_id and exists then
-		msg.post(game_object_id, message_id)
-	end
+	return ok
 end
+
 
 function update(self, dt)
 	-- skip one frame to give the collision data a chance to properly update
@@ -100,8 +121,6 @@ function update(self, dt)
 		return
 	end
 
-	local pos = go.get_position()
-
 	--
 	-- RELEASE
 	--
@@ -110,21 +129,23 @@ function update(self, dt)
 			-- release on a game object
 			if self.state.dragging then
 				self.state.dragging = false
-				notify_event(self, self.state.pressed_id, self.state.pressed_group, self.action, cursor.DRAG_END)
+				trigger_event(self, self.state.pressed_id, self.state.pressed_group, self.action, cursor.DRAG_END)
+			elseif self.state.pressed_id == self.state.over_id then
+				trigger_event(self, self.state.pressed_id, self.state.pressed_group, self.action, cursor.CLICKED)
 			end
-			notify_event(self, self.state.pressed_id, self.state.pressed_group, self.action, cursor.RELEASED)
+			trigger_event(self, self.state.pressed_id, self.state.pressed_group, self.action, cursor.RELEASED)
 			self.state.pressed = false
 			self.state.pressed_id = nil
 			self.state.pressed_group = nil
 			-- release on mobile/touch screen should also trigger a cursor_out event
 			if self.mobile and self.state.over_id then
-				notify_event(self, self.state.over_id, self.state.over_group, self.action, cursor.OUT)
+				trigger_event(self, self.state.over_id, self.state.over_group, self.action, cursor.OUT)
 				self.state.over_id = nil
 				self.state.over_group = nil
 			end
 		else
 			-- release without game object
-			notify_event(self, nil, nil, self.action, cursor.RELEASED)
+			trigger_event(self, nil, nil, self.action, cursor.RELEASED)
 		end
 	end
 
@@ -132,7 +153,7 @@ function update(self, dt)
 	-- OUT
 	--
 	if self.state.over_id and self.state.over_id ~= self.collision_id then
-		notify_event(self, self.state.over_id, self.state.over_group, self.action, cursor.OUT)
+		trigger_event(self, self.state.over_id, self.state.over_group, self.action, cursor.OUT)
 		self.state.over_id = nil
 		self.state.over_group = nil
 	end
@@ -144,9 +165,10 @@ function update(self, dt)
 	-- object or on mobile/touch screen while touching and moving finger over collision
 	-- object
 	if (not self.mobile or self.touch) and self.collision_id and self.state.over_id ~= self.collision_id then
-		self.state.over_id = self.collision_id
-		self.state.over_group = self.collision_group
-		notify_event(self, self.state.over_id, self.state.over_group, self.action, cursor.OVER)
+		if trigger_event(self, self.collision_id, self.collision_group, self.action, cursor.OVER) then
+			self.state.over_id = self.collision_id
+			self.state.over_group = self.collision_group
+		end
 	end
 
 	--
@@ -154,32 +176,50 @@ function update(self, dt)
 	--
 	if self.pressed then
 		if not self.state.pressed and self.state.over_id then
-			-- pressed on a game object
-			self.state.pressed = true
-			self.state.pressed_id = self.state.over_id
-			self.state.pressed_group = self.state.over_group
-			self.state.pressed_pos = go.get_position()
-			self.state.pressed_offset = self.state.pressed_pos - go.get_position(self.state.over_id)
-			notify_event(self, self.state.pressed_id, self.state.pressed_group, self.action, cursor.PRESSED)
+			if trigger_event(self, self.state.over_id, self.state.over_group, self.action, cursor.PRESSED) then
+				-- pressed on a game object
+				self.state.pressed = true
+				self.state.pressed_id = self.state.over_id
+				self.state.pressed_group = self.state.over_group
+				self.state.pressed_pos = go.get_position()
+				self.state.pressed_offset = self.state.pressed_pos - go.get_position(self.state.over_id)
+			end
 		else
 			-- pressed without a game object
-			notify_event(self, nil, nil, self.action, cursor.PRESSED)
+			trigger_event(self, nil, nil, self.action, cursor.PRESSED)
 		end
 	end
 
 	--
 	-- DRAG
 	--
+	local cursor_pos = go.get_position()
 	if self.drag and self.state.pressed and not self.state.dragging then
-		local distance = vmath.length(pos - self.state.pressed_pos)
+		local distance = vmath.length(cursor_pos - self.state.pressed_pos)
 		if distance >= self.drag_threshold then
-			self.state.dragging = true
-			notify_event(self, self.state.pressed_id, self.state.pressed_group, self.action, cursor.DRAG_START)
+			if trigger_event(self, self.state.pressed_id, self.state.pressed_group, self.action, cursor.DRAG_START) then
+				self.state.dragging = true
+			end
 		end
 	end
 
 	if self.state.dragging then
-		go.set_position(pos - self.state.pressed_offset, self.state.pressed_id)
+		-- move the dragged object unless it has been deleted while being dragged
+		if not go_exists(self.state.pressed_id) then
+			self.state.dragging = false
+			self.state.pressed = nil
+			self.state.pressed_id = nil
+			self.state.pressed_group = nil
+			self.state.over_id = nil
+			trigger_event(self, self.state.pressed_id, self.state.pressed_group, self.action, cursor.DRAG_END)
+			trigger_event(self, self.state.pressed_id, self.state.pressed_group, self.action, cursor.RELEASED)
+		else
+			-- retain the offset between the cursor and the dragged object and use the z value from the dragged object
+			cursor_pos.x = cursor_pos.x - self.state.pressed_offset.x
+			cursor_pos.y = cursor_pos.y - self.state.pressed_offset.y
+			cursor_pos.z = go.get_position(self.state.pressed_id).z
+			go.set_position(cursor_pos, self.state.pressed_id)
+		end
 	end
 
 	self.collision_id = nil
@@ -190,9 +230,16 @@ end
 
 function on_message(self, message_id, message, sender)
 	if message_id == COLLISION_RESPONSE then
-		if not self.collision_id or go.get_position(self.collision_id).z < message.other_position.z then
-			self.collision_id = message.other_id
-			self.collision_group = message.other_group
+		if self.collisionobject_filter == EMPTY_FILTER or self.collisionobject_filter == sender.fragment then
+			-- always pick the topmost collision object
+			-- but ignore the object we are dragging
+			-- we want to be able to get mouse over/out events while dragging
+			if not self.collision_id or go.get_position(self.collision_id).z < message.other_position.z then
+				if not self.state.dragging or (self.state.dragging and message.other_id ~= self.state.pressed_id) then
+					self.collision_id = message.other_id
+					self.collision_group = message.other_group
+				end
+			end
 		end
 	elseif message_id == INPUT then
 		handle_input(self, message.action_id, message.action)

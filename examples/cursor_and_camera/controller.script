@@ -1,22 +1,28 @@
+local camera = require "orthographic.camera"
 local cursor = require "in.cursor"
 
-function init(self)
-	if not go.get("#cursor", "acquire_input_focus") then
-		self.forward_input = true
-		msg.post(".", "acquire_input_focus")
-	end
+local CAMERA_ID = hash("/camera")
 
-	cursor.listen(msg.url("#cursor"), cursor.DRAG_START, function(message_id, message)
-		-- prevent dragging of blue aliens
-		if message.group == hash("blue") then
-			return true
-		end
-	end)
+
+function init(self)
+	msg.post(".", "acquire_input_focus")
 end
 
 function on_input(self, action_id, action)
-	if self.forward_input then
-		msg.post("#cursor", "input", { action_id = action_id, action = action })
+	local screen = vmath.vector3(action.x, action.y, 0)
+	local world = camera.screen_to_world(CAMERA_ID, screen)
+	action.x = world.x
+	action.y = world.y
+	msg.post("#cursor", "input", { action_id = action_id, action = action })
+	if action.pressed then
+		self.pressed_position = vmath.vector3(screen)
+		self.camera_position = go.get_position(CAMERA_ID)
+		camera.unfollow(CAMERA_ID)
+	elseif action.released then
+		self.pressed_position = nil
+	elseif self.pressed_position then
+		local diff = screen - self.pressed_position
+		go.set_position(self.camera_position - diff, CAMERA_ID)
 	end
 end
 
@@ -33,11 +39,10 @@ function on_message(self, message_id, message, sender)
 	elseif message_id == cursor.RELEASED then
 		print("Released", message.id, message.group, message.x, message.y)
 		label.set_text("info#events", "Released")
-	elseif message_id == cursor.CLICKED then
-		print("Clicked", message.id, message.group, message.x, message.y)
-		label.set_text("info#events", "Clicked")
 		if message.group == hash("blue") then
 			go.delete(message.id)
+		elseif message.group == hash("checkpoint") then
+			camera.follow(CAMERA_ID, message.id, { lerp = 0.5 })
 		end
 	elseif message_id == cursor.DRAG_START then
 		print("Drag started", message.id, message.group, message.x, message.y)
